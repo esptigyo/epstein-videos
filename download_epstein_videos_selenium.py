@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 import argparse
 import csv
 import re
@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import requests
 from requests.utils import requote_uri
 from selenium import webdriver
+from selenium.common.exceptions import InvalidSessionIdException, WebDriverException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -131,6 +132,21 @@ def normalize_pdf_links(links: List[str], dataset: int) -> Set[str]:
     return out
 
 
+def load_page_hrefs(driver: webdriver.Chrome, url: str, retries: int = 1) -> Optional[List[str]]:
+    attempts = 0
+    while attempts <= retries:
+        try:
+            driver.get(url)
+            solve_interstitials(driver)
+            anchors = driver.find_elements(By.XPATH, "//a[@href]")
+            return [a.get_attribute("href") for a in anchors if a.get_attribute("href")]
+        except (InvalidSessionIdException, WebDriverException) as exc:
+            attempts += 1
+            log(f"Page load failed ({attempts}/{retries + 1}): {url} :: {exc.__class__.__name__}")
+            time.sleep(2)
+    return None
+
+
 def extract_page_numbers(links: List[str], dataset: int) -> Set[int]:
     out: Set[int] = set()
     patt = re.compile(
@@ -146,17 +162,25 @@ def extract_page_numbers(links: List[str], dataset: int) -> Set[int]:
     return out
 
 
-def collect_dataset_pdf_urls(driver: webdriver.Chrome, dataset: int, max_pages: int) -> Set[str]:
+def collect_dataset_pdf_urls(
+    driver: webdriver.Chrome,
+    dataset: int,
+    max_pages: int,
+    refresh_before_each_page: bool,
+    page_delay: float,
+) -> Set[str]:
     start_url = DATASET_URL.format(dataset=dataset)
     all_pdfs: Set[str] = set()
     denied_pages = 0
 
     log(f"Open dataset page: {start_url}")
-    driver.get(start_url)
-    solve_interstitials(driver)
+    if refresh_before_each_page:
+        ensure_authenticated(driver)
+    hrefs = load_page_hrefs(driver, start_url, retries=1)
+    if hrefs is None:
+        log(f"Dataset {dataset}: unable to load first page, skipping dataset.")
+        return all_pdfs
 
-    anchors = driver.find_elements(By.XPATH, "//a[@href]")
-    hrefs = [a.get_attribute("href") for a in anchors if a.get_attribute("href")]
     all_pdfs |= normalize_pdf_links(hrefs, dataset)
 
     page_numbers = extract_page_numbers(hrefs, dataset)
@@ -169,11 +193,15 @@ def collect_dataset_pdf_urls(driver: webdriver.Chrome, dataset: int, max_pages: 
     for page in range(1, last_page + 1):
         page_url = f"{start_url}?page={page}"
         log(f"Open dataset page: {page_url}")
-        driver.get(page_url)
-        solve_interstitials(driver)
+        if page_delay > 0:
+            time.sleep(page_delay)
+        if refresh_before_each_page:
+            ensure_authenticated(driver)
 
-        anchors = driver.find_elements(By.XPATH, "//a[@href]")
-        hrefs = [a.get_attribute("href") for a in anchors if a.get_attribute("href")]
+        hrefs = load_page_hrefs(driver, page_url, retries=1)
+        if hrefs is None:
+            log(f"Dataset {dataset} page {page}: browser session failed; stopping this dataset.")
+            break
         pdfs = normalize_pdf_links(hrefs, dataset)
         page_count += 1
 
@@ -379,6 +407,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pdf-marker", default="No Images Produced")
     p.add_argument("--extensions", nargs="+", default=DEFAULT_EXTENSIONS)
     p.add_argument("--headful", action="store_true", help="Run Chrome non-headless")
+    p.add_argument(
+        "--refresh-before-each-page",
+        action="store_true",
+        help="Re-authenticate before each dataset page request (slower, but can reduce blocking)",
+    )
+    p.add_argument(
+        "--page-delay",
+        type=float,
+        default=0.75,
+        help="Delay in seconds before each dataset page request",
+    )
     p.add_argument("--force", action="store_true", help="Overwrite existing files")
     p.add_argument("--probe-only", action="store_true", help="Find video URLs without downloading")
     p.add_argument("--max-stems", type=int, default=0, help="Limit stems for testing")
@@ -413,7 +452,13 @@ def main() -> int:
 
         pdf_urls: Set[str] = set()
         for dataset in args.datasets:
-            pdf_urls |= collect_dataset_pdf_urls(driver, dataset, args.max_pages)
+            pdf_urls |= collect_dataset_pdf_urls(
+                driver=driver,
+                dataset=dataset,
+                max_pages=args.max_pages,
+                refresh_before_each_page=args.refresh_before_each_page,
+                page_delay=args.page_delay,
+            )
 
         if not pdf_urls:
             log("No PDF links discovered.")
