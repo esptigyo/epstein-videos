@@ -1,5 +1,7 @@
 ### Full usage:
 - python .\download_epstein_videos_selenium.py --headful --datasets 9 10 11 12 --pdf-marker "No Images Produced"
+- python .\download_epstein_videos_selenium.py --headful --datasets 9 10 11 12 --refresh-before-each-page --page-delay 1.5
+
 
 
 ### Test usage:
