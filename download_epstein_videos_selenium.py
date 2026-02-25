@@ -6,7 +6,7 @@ import sys
 import time
 import zipfile
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 import requests
@@ -38,6 +38,10 @@ AGE_BOOTSTRAP_URL = (
     "https://www.justice.gov/age-verify?destination="
     "/epstein/files/DataSet%2010/EFTA01683314.pdf"
 )
+
+
+class DriverSessionLost(RuntimeError):
+    pass
 
 
 def log(msg: str) -> None:
@@ -92,6 +96,29 @@ def ensure_authenticated(driver: webdriver.Chrome) -> None:
     solve_interstitials(driver)
 
 
+def ensure_live_authenticated_session(
+    driver: webdriver.Chrome, headless: bool, retries: int = 2
+) -> Tuple[webdriver.Chrome, requests.Session]:
+    last_exc: Optional[Exception] = None
+    current = driver
+    for _ in range(retries + 1):
+        try:
+            ensure_authenticated(current)
+            return current, build_session_from_driver(current)
+        except (InvalidSessionIdException, WebDriverException) as exc:
+            msg = str(exc).lower()
+            if isinstance(exc, InvalidSessionIdException) or "invalid session id" in msg:
+                last_exc = exc
+                try:
+                    current.quit()
+                except Exception:
+                    pass
+                current = make_driver(headless=headless)
+                continue
+            raise
+    raise DriverSessionLost(f"Unable to restore browser session: {last_exc}")
+
+
 def build_session_from_driver(driver: webdriver.Chrome) -> requests.Session:
     session = requests.Session()
     session.headers.update(
@@ -140,7 +167,11 @@ def load_page_hrefs(driver: webdriver.Chrome, url: str, retries: int = 1) -> Opt
             solve_interstitials(driver)
             anchors = driver.find_elements(By.XPATH, "//a[@href]")
             return [a.get_attribute("href") for a in anchors if a.get_attribute("href")]
+        except InvalidSessionIdException as exc:
+            raise DriverSessionLost(str(exc)) from exc
         except (InvalidSessionIdException, WebDriverException) as exc:
+            if "invalid session id" in str(exc).lower():
+                raise DriverSessionLost(str(exc)) from exc
             attempts += 1
             log(f"Page load failed ({attempts}/{retries + 1}): {url} :: {exc.__class__.__name__}")
             time.sleep(2)
@@ -175,7 +206,12 @@ def collect_dataset_pdf_urls(
 
     log(f"Open dataset page: {start_url}")
     if refresh_before_each_page:
-        ensure_authenticated(driver)
+        try:
+            ensure_authenticated(driver)
+        except (InvalidSessionIdException, WebDriverException) as exc:
+            if isinstance(exc, InvalidSessionIdException) or "invalid session id" in str(exc).lower():
+                raise DriverSessionLost(str(exc)) from exc
+            raise
     hrefs = load_page_hrefs(driver, start_url, retries=1)
     if hrefs is None:
         log(f"Dataset {dataset}: unable to load first page, skipping dataset.")
@@ -196,7 +232,12 @@ def collect_dataset_pdf_urls(
         if page_delay > 0:
             time.sleep(page_delay)
         if refresh_before_each_page:
-            ensure_authenticated(driver)
+            try:
+                ensure_authenticated(driver)
+            except (InvalidSessionIdException, WebDriverException) as exc:
+                if isinstance(exc, InvalidSessionIdException) or "invalid session id" in str(exc).lower():
+                    raise DriverSessionLost(str(exc)) from exc
+                raise
 
         hrefs = load_page_hrefs(driver, page_url, retries=1)
         if hrefs is None:
@@ -444,21 +485,31 @@ def main() -> int:
 
     driver = make_driver(headless=not args.headful)
     session: Optional[requests.Session] = None
+    headless = not args.headful
 
     try:
         log("Initializing authenticated browser session...")
-        ensure_authenticated(driver)
-        session = build_session_from_driver(driver)
+        driver, session = ensure_live_authenticated_session(driver, headless=headless)
 
         pdf_urls: Set[str] = set()
         for dataset in args.datasets:
-            pdf_urls |= collect_dataset_pdf_urls(
-                driver=driver,
-                dataset=dataset,
-                max_pages=args.max_pages,
-                refresh_before_each_page=args.refresh_before_each_page,
-                page_delay=args.page_delay,
-            )
+            attempts = 0
+            while attempts < 2:
+                try:
+                    pdf_urls |= collect_dataset_pdf_urls(
+                        driver=driver,
+                        dataset=dataset,
+                        max_pages=args.max_pages,
+                        refresh_before_each_page=args.refresh_before_each_page,
+                        page_delay=args.page_delay,
+                    )
+                    break
+                except DriverSessionLost:
+                    attempts += 1
+                    log(f"Dataset {dataset}: browser session lost, recreating browser ({attempts}/2)")
+                    driver, session = ensure_live_authenticated_session(driver, headless=headless)
+            if attempts >= 2:
+                log(f"Dataset {dataset}: skipped after repeated browser session loss.")
 
         if not pdf_urls:
             log("No PDF links discovered.")
@@ -470,13 +521,11 @@ def main() -> int:
         for u in sorted(pdf_urls):
             checked += 1
             if checked == 1 or (args.refresh_every > 0 and checked % args.refresh_every == 0):
-                ensure_authenticated(driver)
-                session = build_session_from_driver(driver)
+                driver, session = ensure_live_authenticated_session(driver, headless=headless)
 
             status = pdf_contains_marker(session, u, args.pdf_marker)
             if status == "refresh":
-                ensure_authenticated(driver)
-                session = build_session_from_driver(driver)
+                driver, session = ensure_live_authenticated_session(driver, headless=headless)
                 status = pdf_contains_marker(session, u, args.pdf_marker)
 
             if status == "hit":
@@ -505,8 +554,7 @@ def main() -> int:
         for idx, stem in enumerate(stems, start=1):
             if idx == 1 or (args.refresh_every > 0 and idx % args.refresh_every == 0):
                 log("Refreshing access cookies...")
-                ensure_authenticated(driver)
-                session = build_session_from_driver(driver)
+                driver, session = ensure_live_authenticated_session(driver, headless=headless)
 
             found = False
             for ext in args.extensions:
@@ -515,8 +563,7 @@ def main() -> int:
 
                 if result and result.get("status") == "refresh":
                     log("Session challenged; re-authenticating and retrying...")
-                    ensure_authenticated(driver)
-                    session = build_session_from_driver(driver)
+                    driver, session = ensure_live_authenticated_session(driver, headless=headless)
                     result = download_candidate(session, candidate, out_dir, args.force, args.probe_only)
 
                 if result and result.get("status") == "ok":
